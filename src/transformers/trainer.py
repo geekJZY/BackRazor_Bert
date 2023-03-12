@@ -28,7 +28,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from tools.memory_cost_profiler import profile_memory_cost
+from .memory_cost_profiler import profile_memory_cost
 
 from tqdm.auto import tqdm
 

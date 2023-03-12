@@ -141,9 +141,14 @@ class BertConfig(PretrainedConfig):
         position_embedding_type="absolute",
         use_cache=True,
         classifier_dropout=None,
-        num_sparse=False,
-        scale=32,
-        learnable=False,
+        apply_lora=False,
+        apply_sparse=False,
+        lora_r=4,
+        lora_alpha=32,
+        slimming=False,
+        backRazor=False,
+        half=True,
+        quantize=False,
         **kwargs
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -164,9 +169,14 @@ class BertConfig(PretrainedConfig):
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
-        self.num_sparse = num_sparse
-        self.scale = scale
-        self.learnable = learnable
+        self.apply_lora = apply_lora
+        self.apply_sparse = apply_sparse
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.slimming=slimming
+        self.backRazor = backRazor
+        self.half = half
+        self.quantize = quantize
 
 
 class BertOnnxConfig(OnnxConfig):

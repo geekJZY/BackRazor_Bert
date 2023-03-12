@@ -53,10 +53,21 @@ from ...modeling_utils import (
     apply_chunking_to_forward,
     find_pruneable_heads_and_indices,
     prune_linear_layer,
+    prune_linear_layer_pruned,
 )
 from ...utils import logging
 from .configuration_bert import BertConfig
 
+from ..custom_functions.masker import Masker
+from ..custom_functions.custom_fc import LinearSparse
+from ..custom_functions.custom_softmax import SoftmaxSparse
+from ..custom_functions.custom_gelu import GELUSparse
+from ..custom_functions.custom_matmul import MatMulSparse
+from ..custom_functions.custom_layer_norm import LayerNormSparse
+from ..custom_functions.custom_softmax_matmul import SoftmaxMatMulSparse
+
+
+from pdb import set_trace
 
 logger = logging.get_logger(__name__)
 
@@ -90,6 +101,10 @@ BERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all BERT models at https://huggingface.co/models?filter=bert
 ]
 
+import numpy as np
+
+masker = Masker(prune_ratio=0.8)
+backrazor_items = ["fc", "matmul", "softmax", "layernorm", "gelu"]
 
 def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
     """Load tf checkpoints in a pytorch model."""
@@ -238,26 +253,15 @@ class BertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
-        self.scale = config.scale
-        query_list = [nn.Linear(config.hidden_size, self.all_head_size, bias=False)]
-        query_list = query_list + [nn.Linear(self.all_head_size, self.all_head_size, bias=False) for i in range(config.num_sparse - 1)]
-
-        self.query_sparse = nn.Sequential(
-            *query_list
-        )
-        #self.query_sparse_s3 = nn.Linear(self.all_head_size, self.all_head_size, bias=False)
-
-        value_list = [nn.Linear(config.hidden_size, self.all_head_size, bias=False)]
-        value_list = value_list + [nn.Linear(self.all_head_size, self.all_head_size, bias=False) for i in range(config.num_sparse - 1)]
-        self.value_sparse = nn.Sequential(
-            *value_list
-        )
-        #self.value_sparse_s3 = nn.Linear(self.all_head_size, self.all_head_size, bias=False)
-        
-    
+        self.backRazor = config.backRazor
+        if config.backRazor:
+            self.query = LinearSparse(config.hidden_size, self.all_head_size, quantize=config.quantize, half=config.half, masker=masker)
+            self.key = LinearSparse(config.hidden_size, self.all_head_size, quantize=config.quantize, half=config.half, masker=masker)
+            self.value = LinearSparse(config.hidden_size, self.all_head_size, quantize=config.quantize, half=config.half, masker=masker)
+        else:
+            self.query = nn.Linear(config.hidden_size, self.all_head_size)
+            self.key = nn.Linear(config.hidden_size, self.all_head_size)
+            self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -266,6 +270,13 @@ class BertSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+
+        if config.backRazor:
+            self.mm1 = MatMulSparse(quantize=config.quantize, half=config.half, masker=masker)
+                # self.softmax_mm2 = SoftmaxMatMulSparse(quantize=config.quantize, masker=masker, dim=-1)
+            self.mm2 = MatMulSparse(quantize=config.quantize, half=config.half, masker=masker)
+            self.softmax_mm2 = SoftmaxMatMulSparse(dim=-1, quantize=config.quantize, half=config.half, masker=masker)
+            self.mm2 = None
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -309,8 +320,6 @@ class BertSelfAttention(nn.Module):
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
-        query_layer = query_layer + self.scale * self.transpose_for_scores(self.query_sparse(hidden_states))
-        key_layer = key_layer + self.scale * self.transpose_for_scores(self.value_sparse(hidden_states))
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
             # Further calls to cross_attention layer can then reuse all cross-attention
@@ -322,7 +331,10 @@ class BertSelfAttention(nn.Module):
             past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        if self.backRazor:
+            attention_scores = self.mm1(query_layer, key_layer.transpose(-1, -2))
+        else:
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             seq_length = hidden_states.size()[1]
@@ -345,18 +357,15 @@ class BertSelfAttention(nn.Module):
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
             attention_scores = attention_scores + attention_mask
 
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
-
-        context_layer = torch.matmul(attention_probs, value_layer)
+        if self.backRazor:
+            if self.mm2 is None:
+                context_layer = self.softmax_mm2(attention_scores, value_layer)
+            else:
+                attention_probs = self.softmax(attention_scores)
+                context_layer = self.mm2(attention_probs, value_layer)
+        else:
+            attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+            context_layer = torch.matmul(attention_probs, value_layer)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -372,8 +381,12 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if config.backRazor:
+            self.dense = LinearSparse(config.hidden_size, config.hidden_size, quantize=config.quantize, half=config.half, masker=masker)
+            self.LayerNorm = LayerNormSparse(config.hidden_size, eps=config.layer_norm_eps, masker=masker, quantize=config.quantize)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -389,25 +402,7 @@ class BertAttention(nn.Module):
         self.self = BertSelfAttention(config)
         self.output = BertSelfOutput(config)
         self.pruned_heads = set()
-
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
-        )
-
-        # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
-        # Update hyper params and store pruned heads
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
-
+        self.config = config
     def forward(
         self,
         hidden_states,
@@ -435,7 +430,12 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.backRazor = config.backRazor
+        if config.backRazor:
+            self.dense = LinearSparse(config.hidden_size, config.intermediate_size, quantize=config.quantize, half=config.half)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -450,8 +450,12 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if config.backRazor:
+            self.dense = LinearSparse(config.intermediate_size, config.hidden_size, quantize=config.quantize, half=config.half)
+            self.LayerNorm = LayerNormSparse(config.hidden_size, eps=config.layer_norm_eps, quantize=config.quantize, half=config.half)
+        else:
+            self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
@@ -474,7 +478,8 @@ class BertLayer(nn.Module):
             self.crossattention = BertAttention(config)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
-
+        self.pruned_inter_neurons = set()
+        self.inter_slimming = False
     def forward(
         self,
         hidden_states,
@@ -644,7 +649,10 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if config.backRazor:
+            self.dense = LinearSparse(config.hidden_size, config.hidden_size, quantize=config.quantize, half=config.half)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
@@ -751,15 +759,8 @@ class BertPreTrainedModel(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-
-        def zero_init(m):
-            if type(m) == nn.Linear:
-                m.weight.data.zero_()
-        if isinstance(module, BertSelfAttention):
-            module.value_sparse.apply(zero_init)
-            module.query_sparse.apply(zero_init)
-
-
+        elif isinstance(module, BertSelfAttention):
+            pass
 
 @dataclass
 class BertForPreTrainingOutput(ModelOutput):
@@ -1517,7 +1518,12 @@ class BertForSequenceClassification(BertPreTrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+        if config.backRazor:
+            self.classifier = LinearSparse(config.hidden_size, config.num_labels, quantize=config.quantize,
+                                           half=config.half, masker=masker)
+        else:
+            self.classifier = nn.Linear(config.hidden_size, config.num_labels)
 
         self.init_weights()
 

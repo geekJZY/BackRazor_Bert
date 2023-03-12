@@ -28,9 +28,11 @@ import time
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from .memory_cost_profiler import profile_memory_cost
 
 from tqdm.auto import tqdm
 
+from pdb import set_trace
 
 # Integrations must be imported before ML frameworks:
 from .integrations import (  # isort: split
@@ -120,7 +122,6 @@ from .trainer_utils import (
     default_hp_space,
     denumpify_detensorize,
     get_last_checkpoint,
-    l0proj,
     number_of_arguments,
     set_seed,
     speed_metrics,
@@ -1050,12 +1051,6 @@ class Trainer:
                 "instead.",
                 FutureWarning,
             )
-
-        if 'l0proj_sparse' in kwargs:
-            l0proj_sparse = kwargs['l0proj_sparse']
-        else:
-            l0proj_sparse = 10000000000
-        kwargs.pop("l0proj_sparse")
         if len(kwargs) > 0:
             raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
         # This might change the seed so needs to run first.
@@ -1116,6 +1111,17 @@ class Trainer:
 
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
+
+        mem_test_input = next(iter(train_dataloader))
+        mem_test_input = self._prepare_inputs(mem_test_input)
+        # keep batch size to be 1
+        mem_test_input = {key: item[0:1] for key, item in mem_test_input.items()}
+        memory_cost, memory_cost_dict = profile_memory_cost(self.model, mem_test_input,
+                                                            batch_size=train_dataloader.batch_size)
+
+        MB = 1024 * 1024
+        logger.info("memory_cost is {:.1f} MB, param size is {:.1f} MB, act_size each sample is {:.1f} MB".
+                    format(memory_cost / MB, memory_cost_dict["param_size"] / MB, memory_cost_dict["act_size"] / MB))
 
         # Setting up training control variables:
         # number of training epochs: num_train_epochs
@@ -1366,7 +1372,6 @@ class Trainer:
                     if optimizer_was_run and not self.deepspeed:
                         self.lr_scheduler.step()
 
-                    l0proj(model, l0proj_sparse, False)
                     model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
@@ -1378,9 +1383,11 @@ class Trainer:
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
-    
-            self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
 
+            MB = 1024 * 1024
+            logger.info("Peak memory usage: {:.1f} MB".format(torch.cuda.max_memory_allocated() / MB))
+
+            self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
             self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
@@ -1444,7 +1451,7 @@ class Trainer:
         self.log(metrics)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-        
+
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
     def _load_state_dict_in_model(self, state_dict):
@@ -1469,6 +1476,7 @@ class Trainer:
 
             logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
             logs["learning_rate"] = self._get_learning_rate()
+
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
@@ -1583,7 +1591,6 @@ class Trainer:
             metric_to_check = self.args.metric_for_best_model
             if not metric_to_check.startswith("eval_"):
                 metric_to_check = f"eval_{metric_to_check}"
-            print(metrics)
             metric_value = metrics[metric_to_check]
 
             operator = np.greater if self.args.greater_is_better else np.less
@@ -1833,6 +1840,22 @@ class Trainer:
         if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
             # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
             loss = loss / self.args.gradient_accumulation_steps
+
+        l1_loss_self_coef = kwargs.get('l1_loss_self_coef', 0.0)
+        if l1_loss_self_coef > 0.0:
+            l1_self_loss = 0.0
+            for m in model.modules():
+                if isinstance(m, BertSelfAttention) and m.self_slimming:
+                    l1_self_loss += m.slimming_coef.abs().sum()
+            loss += l1_self_loss * l1_loss_self_coef
+
+        l1_loss_inter_coef = kwargs.get('l1_loss_inter_coef', 0.0)
+        if l1_loss_inter_coef > 0.0:
+            l1_inter_loss = 0.0
+            for m in model.modules():
+                if isinstance(m, BertLayer) and m.inter_slimming:
+                    l1_inter_loss += m.slimming_coef.abs().sum()
+            loss += l1_inter_loss * l1_loss_inter_coef
 
         if self.use_amp:
             self.scaler.scale(loss).backward()
@@ -2106,6 +2129,7 @@ class Trainer:
                 num_steps=math.ceil(output.num_samples / total_batch_size),
             )
         )
+        output.metrics.update([])
 
         self.log(output.metrics)
 
@@ -2250,6 +2274,7 @@ class Trainer:
         observed_num_examples = 0
         # Main evaluation loop
         for step, inputs in enumerate(dataloader):
+            # print(self.floating_point_ops(inputs))
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:

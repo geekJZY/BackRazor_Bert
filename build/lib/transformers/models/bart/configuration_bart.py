@@ -140,8 +140,6 @@ class BartConfig(PretrainedConfig):
         is_encoder_decoder=True,
         decoder_start_token_id=2,
         forced_eos_token_id=2,
-        num_sparse=False,
-        scale=32,
         **kwargs
     ):
         self.vocab_size = vocab_size
@@ -165,8 +163,7 @@ class BartConfig(PretrainedConfig):
         self.num_hidden_layers = encoder_layers
         self.gradient_checkpointing = gradient_checkpointing
         self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
-        self.num_sparse = num_sparse
-        self.scale = scale
+
         super().__init__(
             num_labels=num_labels,
             pad_token_id=pad_token_id,

@@ -130,19 +130,15 @@ class BartAttention(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        scale: int,
-        num_sparse: int,
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
-        
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
-        self.scale = scale
         assert (
             self.head_dim * num_heads == self.embed_dim
         ), f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {num_heads})."
@@ -153,20 +149,6 @@ class BartAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-
-        query_list = [nn.Linear(embed_dim, embed_dim, bias=False)]
-        query_list = query_list + [nn.Linear(embed_dim, embed_dim, bias=False) for i in range(num_sparse - 1)]
-
-        self.query_sparse = nn.Sequential(
-            *query_list
-        )
-        #self.query_sparse_s3 = nn.Linear(self.all_head_size, self.all_head_size, bias=False)
-
-        value_list = [nn.Linear(embed_dim, embed_dim, bias=False)]
-        value_list = value_list + [nn.Linear(embed_dim, embed_dim, bias=False) for i in range(num_sparse - 1)]
-        self.value_sparse = nn.Sequential(
-            *value_list
-        )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -188,7 +170,7 @@ class BartAttention(nn.Module):
         bsz, tgt_len, embed_dim = hidden_states.size()
 
         # get query proj
-        query_states = self.q_proj(hidden_states) * self.scaling + self.query_sparse(hidden_states) * self.scale
+        query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
         if is_cross_attention and past_key_value is not None:
             # reuse k,v, cross_attentions
@@ -207,7 +189,7 @@ class BartAttention(nn.Module):
         else:
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-            value_states = self._shape(self.v_proj(hidden_states) + self.value_sparse(hidden_states) * self.scale, -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
@@ -221,7 +203,6 @@ class BartAttention(nn.Module):
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
-
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
@@ -287,8 +268,6 @@ class BartEncoderLayer(nn.Module):
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.attention_dropout,
-            scale=config.scale,
-            num_sparse=config.num_sparse
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -359,8 +338,6 @@ class BartDecoderLayer(nn.Module):
             num_heads=config.decoder_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
-            scale=config.scale,
-            num_sparse=config.num_sparse
         )
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
@@ -372,8 +349,6 @@ class BartDecoderLayer(nn.Module):
             config.decoder_attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
-            scale=config.scale,
-            num_sparse=config.num_sparse
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.fc1 = nn.Linear(self.embed_dim, config.decoder_ffn_dim)

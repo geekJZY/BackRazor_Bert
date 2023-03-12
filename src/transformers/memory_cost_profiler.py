@@ -14,10 +14,10 @@ from torchvision.models.mobilenet import InvertedResidual
 from transformers.models.bert.modeling_bert import BertSelfAttention, BertIntermediate
 
 from pdb import set_trace
-from custom_functions.custom_fc import LinearSparse
-from custom_functions.custom_softmax import SoftmaxSparse
-from custom_functions.custom_gelu import GELUSparse
-from custom_functions.custom_layer_norm import LayerNormSparse
+from .models.custom_functions.custom_fc import LinearSparse
+from .models.custom_functions.custom_softmax import SoftmaxSparse
+from .models.custom_functions.custom_gelu import GELUSparse
+from .models.custom_functions.custom_layer_norm import LayerNormSparse
 
 
 __all__ = ['count_model_size', 'count_activation_size', 'profile_memory_cost']

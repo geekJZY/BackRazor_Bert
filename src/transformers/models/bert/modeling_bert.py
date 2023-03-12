@@ -58,13 +58,13 @@ from ...modeling_utils import (
 from ...utils import logging
 from .configuration_bert import BertConfig
 
-from custom_functions.masker import Masker
-from custom_functions.custom_fc import LinearSparse
-from custom_functions.custom_softmax import SoftmaxSparse
-from custom_functions.custom_gelu import GELUSparse
-from custom_functions.custom_matmul import MatMulSparse
-from custom_functions.custom_layer_norm import LayerNormSparse
-from custom_functions.custom_softmax_matmul import SoftmaxMatMulSparse
+from ..custom_functions.masker import Masker
+from ..custom_functions.custom_fc import LinearSparse
+from ..custom_functions.custom_softmax import SoftmaxSparse
+from ..custom_functions.custom_gelu import GELUSparse
+from ..custom_functions.custom_matmul import MatMulSparse
+from ..custom_functions.custom_layer_norm import LayerNormSparse
+from ..custom_functions.custom_softmax_matmul import SoftmaxMatMulSparse
 
 
 from pdb import set_trace
